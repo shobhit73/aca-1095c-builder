@@ -619,26 +619,72 @@ else:
     default_line16 = rest[:12] if len(rest) >= 12 else []
 
 # --- Auto-map Part I (Employee info) fields ---
-def auto_map_part1(widgets):
-    name = ssn = addr = city = statezip = plan = None
-    if not widgets: return name, ssn, addr, city, statezip, plan
-    # crude: pick first 6 text fields near top-left of page
+# Improved: use the detected Line 14 row (12 monthly boxes) as a baseline for Part I.
+# 1) Find Line 14 Y center (topmost row with >=12 fields)
+# 2) Above that baseline, split by left/right columns using page mid X
+# 3) Map left-column rows (top→bottom) to: Name, SSN, Address, City, State/ZIP
+# 4) Heuristic for Plan Start Month: narrow field just above the month grid on the right
+
+def auto_map_part1_fields(pdf_bytes: bytes):
+    widgets = extract_pdf_widgets(pdf_bytes)
+    if not widgets:
+        return None
     first = [w for w in widgets if w['page']==0]
-    first.sort(key=lambda w:(-w['yc'], w['xc']))
-    if len(first)>=6:
-        name = first[0]['name']
-        ssn = first[1]['name']
-        addr = first[2]['name']
-        city = first[3]['name']
-        statezip = first[4]['name']
-        plan = first[5]['name']
+    if not first:
+        return None
+    # Page width for midline
+    try:
+        pdf = PdfReader(io.BytesIO(pdf_bytes))
+        media = pdf.pages[0].MediaBox
+        page_w = float(media[2])
+    except Exception:
+        page_w = max([w['x2'] for w in first] + [612.0])
+    mid_x = page_w/2.0
+
+    # Cluster rows and locate Line 14 baseline
+    rows = _cluster_rows(first, y_tol=10.0)
+    cand = [r for r in rows if len(r) >= 12]
+    cand.sort(key=lambda r: -np.mean([w['yc'] for w in r]))
+    if not cand:
+        return None
+    y14 = float(np.mean([w['yc'] for w in cand[0]]))
+
+    # Part I lives above y14, left column
+    left_part1 = [w for w in first if (w['yc'] > y14 + 10) and (w['xc'] < mid_x - 10)]
+    left_rows = _cluster_rows(left_part1, y_tol=10.0)
+    # Sort top→bottom
+    left_rows.sort(key=lambda r: -np.mean([w['yc'] for w in r]))
+
+    # Helper to choose a single field from a row (prefer leftmost)
+    def pick_name(row):
+        row.sort(key=lambda z: z['xc'])
+        return row[0]['name'] if row else None
+
+    name = ssn = addr = city = statezip = None
+    if len(left_rows) >= 1: name = pick_name(left_rows[0])
+    if len(left_rows) >= 2: ssn = pick_name(left_rows[1])
+    if len(left_rows) >= 3: addr = pick_name(left_rows[2])
+    if len(left_rows) >= 4: city = pick_name(left_rows[3])
+    if len(left_rows) >= 5: statezip = pick_name(left_rows[4])
+    # If there is a sixth row, prefer it for statezip instead (many IRS forms have two bottom rows)
+    if len(left_rows) >= 6:
+        statezip = pick_name(left_rows[5])
+
+    # Plan Start Month: find a small box above the month grid on the right side
+    band = [w for w in first if (y14 + 10 <= w['yc'] <= y14 + 80) and (w['xc'] > mid_x + 60)]
+    plan = None
+    if band:
+        band.sort(key=lambda z: (-(z['xc']), (z['x2']-z['x1'])))  # rightmost & narrow-ish first
+        plan = band[0]['name']
+
     return name, ssn, addr, city, statezip, plan
 
-widgets_all = extract_pdf_widgets(pdf_bytes)
-part1_map = auto_map_part1(widgets_all)
-if part1_map[0]:
-    fld_emp_name, fld_emp_ssn, fld_emp_address, fld_emp_city, fld_emp_state_zip, fld_plan_start = part1_map
-    st.success("Auto-mapped Part I employee info fields.")
+part1_auto = auto_map_part1_fields(pdf_bytes)
+if part1_auto:
+    fld_emp_name, fld_emp_ssn, fld_emp_address, fld_emp_city, fld_emp_state_zip, fld_plan_start = part1_auto
+    st.success("Auto-mapped Part I employee fields (Name, SSN, Address, City, State/ZIP, Plan Start).")
+else:
+    st.warning("Couldn't auto-map Part I fields. You can still map them manually below if needed.")
 
 
 # ---------- Use auto-mapped fields to fill & download PDFs ----------
