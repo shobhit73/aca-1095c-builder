@@ -25,8 +25,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from pdfrw import PdfReader, PdfWriter, PageMerge, PdfDict
 from dateutil.parser import parse as dtparse  # noqa: F401
-from pdfrw import PdfReader, PdfWriter, PageMerge
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter  # noqa: F401
 import fitz  # PyMuPDF — used for robust Part I overlay by labels/widgets
@@ -537,13 +537,13 @@ def _format_ssn(s: str) -> str:
     ds = re.sub(r"\D", "", str(s or ""))
     return f"{ds[:3]}-{ds[3:5]}-{ds[5:9]}" if len(ds) == 9 else (s or "")
 
+# replace your existing fill_part1_fields_strict with this version
 def fill_part1_fields_strict(pdf_bytes: bytes, part1: dict) -> (bytes, bool):
     """
     Try to fill real AcroForm fields for Part I using pdfrw.
     Returns (new_pdf_bytes, filled_any: bool)
       part1 keys: name, ssn, address, city, state, countryzip, plan
     """
-    # Common field-name variants seen in IRS 1095-C templates
     CANDS = {
         "name":      ["f1_1[0]", "employeename[0]", "employee_name", "name", "employee name"],
         "ssn":       ["f1_2[0]", "ssn", "employee_ssn", "employeesocialsecuritynumber[0]"],
@@ -569,10 +569,8 @@ def fill_part1_fields_strict(pdf_bytes: bytes, part1: dict) -> (bytes, bool):
             k = key.lower()
 
             def matches(cands):
-                # allow exact or suffix match (some tools prefix hierarchies)
                 return any(k == c or k.endswith(c) for c in cands)
 
-            # find which logical field this is
             target = None
             for logical, cands in lower_cands.items():
                 if matches(cands):
@@ -586,19 +584,22 @@ def fill_part1_fields_strict(pdf_bytes: bytes, part1: dict) -> (bytes, bool):
             if not val:
                 continue
             if target == "ssn":
-                val = _format_ssn(val)
+                ds = re.sub(r"\D", "", val)
+                val = f"{ds[:3]}-{ds[3:5]}-{ds[5:9]}" if len(ds) == 9 else val
 
             a.V = val
             a.AP = None
             filled += 1
 
-    # Ensure NeedAppearances so values render in viewers
-    if hasattr(r, "Root") and getattr(r.Root, "AcroForm", None):
-        r.Root.AcroForm.update(dict(NeedAppearances=True))
+    # ✅ Use PdfDict, not dict — and create AcroForm if missing
+    if not getattr(r.Root, "AcroForm", None):
+        r.Root.AcroForm = PdfDict()
+    r.Root.AcroForm.update(PdfDict(NeedAppearances=True))
 
     out = io.BytesIO()
     PdfWriter().write(out, r)
     return out.getvalue(), filled > 0
+
 
 # ---------------------- App ----------------------
 
