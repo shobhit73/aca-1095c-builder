@@ -439,22 +439,47 @@ def auto_map_fields(pdf_bytes: bytes):
 
 def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
     """
-    Draw Part I values by:
-      1) locating printed label text (e.g., '1 Name of employee') on page 1
-      2) finding the nearest form widget RECT on the same row to the RIGHT
-      3) writing the value inside that widget box (left column only)
-
-    values keys: name, ssn, address, city, statezip, plan
+    Robust Part I overlay:
+      • Find the printed label (e.g., '1 Name of employee')
+      • Find the employer-side widget on the same row to COPY its y-bounds
+      • Draw inside the LEFT column (label→midline), centered in that row
+    keys in values: name, ssn, address, city, statezip, plan
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
     W = page.rect.width
+    mid_x = W / 2.0  # split left (employee) vs right (employer)
 
-    # widgets geometry for page 1
-    widgets = [w for w in extract_pdf_widgets(pdf_bytes) if w.get('page') == 0]
-    def yc_of(w): return (w['y1'] + w['y2']) / 2.0
-    def label_center_y(r): return (r.y0 + r.y1) / 2.0
-    mid_x = W / 2.0  # split employee (left) vs employer (right)
+    # All widgets on page 1
+    widgets = [w for w in extract_pdf_widgets(pdf_bytes) if w.get("page") == 0]
+
+    def yc_of(w): return (w["y1"] + w["y2"]) / 2.0
+    def label_cy(r): return (r.y0 + r.y1) / 2.0
+
+    # Helper: nearest employer-side widget on same row (to copy y1..y2)
+    def same_row_employer_band(r, tol=12):
+        cy = label_cy(r)
+        cands = [w for w in widgets
+                 if abs(yc_of(w) - cy) <= tol and w["xc"] > mid_x + 6]
+        if not cands:
+            return None
+        # pick the leftmost on the employer side (closest to midline)
+        cands.sort(key=lambda w: w["x1"])
+        return cands[0]
+
+    # Helper: final left-column box for drawing
+    def left_cell_box(label_rect, emp_widget):
+        # x bounds: from just right of label to just left of midline
+        x1 = max(label_rect.x1 + 6, 36)
+        x2 = mid_x - 12
+        # y bounds: copy employer widget row if possible; otherwise shift below label
+        if emp_widget:
+            y1, y2 = emp_widget["y1"], emp_widget["y2"]
+        else:
+            # fallback ~ one text line below the label
+            y1 = label_rect.y0 + 10
+            y2 = label_rect.y0 + 22
+        return fitz.Rect(x1, y1, x2, y2)
 
     LABELS = [
         (["1 Name of employee", "Name of employee"], "name"),
@@ -471,45 +496,40 @@ def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
                 return hits[0]
         return None
 
-    def right_box_fallback(r, pad_right=18):
-        return fitz.Rect(r.x1 + 6, r.y0 - 1, W - pad_right, r.y1 + 9)
-
+    # Draw Name/SSN/Address/City/State+ZIP
     for terms, key in LABELS:
         val = (values.get(key) or "").strip()
-        if not val: continue
+        if not val:
+            continue
         r = find_first(terms)
-        if not r: continue
-        y0 = label_center_y(r)
-        cands = [
-            w for w in widgets
-            if abs(yc_of(w) - y0) <= 12 and w['x1'] > (r.x1 + 4) and (w['x1'] + w['x2']) / 2.0 < (mid_x - 6)
-        ]
-        if cands:
-            cands.sort(key=lambda w: w['x1'])
-            w = cands[0]
-            box = fitz.Rect(w['x1'] + 2, w['y1'] - 1, w['x2'] - 2, w['y2'] + 1)
-        else:
-            box = right_box_fallback(r)
+        if not r:
+            continue
+        emp_band = same_row_employer_band(r)
+        box = left_cell_box(r, emp_band)
         page.insert_textbox(box, val, fontsize=9, fontname="helv", align=0)
 
-    # Plan Start Month (small box to the right of label)
+    # Plan Start Month (small box right of the label)
     r_ps = find_first(["Plan Start Month", "Plan Start"])
     psv = (values.get("plan") or "").strip()
     if r_ps and psv:
-        cands = [
-            w for w in widgets
-            if abs(yc_of(w) - label_center_y(r_ps)) <= 12 and w['x1'] > (r_ps.x1 + 4) and (w['x2'] - w['x1']) < 60
-        ]
+        # prefer a small employer-side widget in same row
+        emp_ps = None
+        cy = label_cy(r_ps)
+        cands = [w for w in widgets
+                 if abs(yc_of(w) - cy) <= 12 and w["x1"] > (r_ps.x1 + 4) and (w["x2"] - w["x1"]) < 60]
         if cands:
-            cands.sort(key=lambda w: w['x1'])
-            w = cands[0]
-            ps_box = fitz.Rect(w['x1'] + 2, w['y1'] - 1, w['x2'] - 2, w['y2'] + 1)
+            cands.sort(key=lambda w: w["x1"])
+            emp_ps = cands[0]
+        if emp_ps:
+            ps_box = fitz.Rect(emp_ps["x1"] + 2, emp_ps["y1"] - 1, emp_ps["x2"] - 2, emp_ps["y2"] + 1)
         else:
-            ps_box = fitz.Rect(r_ps.x1 + 6, r_ps.y0 - 1, r_ps.x1 + 45, r_ps.y1 + 9)
+            ps_box = fitz.Rect(r_ps.x1 + 6, r_ps.y0 + 10, r_ps.x1 + 45, r_ps.y0 + 22)
         page.insert_textbox(ps_box, psv, fontsize=9, fontname="helv", align=0)
 
-    out = io.BytesIO(); doc.save(out)
+    out = io.BytesIO()
+    doc.save(out)
     return out.getvalue()
+
 
 # ---------------------- App ----------------------
 
