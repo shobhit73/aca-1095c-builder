@@ -639,3 +639,117 @@ part1_map = auto_map_part1(widgets_all)
 if part1_map[0]:
     fld_emp_name, fld_emp_ssn, fld_emp_address, fld_emp_city, fld_emp_state_zip, fld_plan_start = part1_map
     st.success("Auto-mapped Part I employee info fields.")
+
+
+# ---------- Use auto-mapped fields to fill & download PDFs ----------
+# Build values and show a clear Generate button with downloads underneath.
+
+# If auto-mapping failed for any reason, fall back to the first 12 fields detected
+l14 = default_line14 if 'default_line14' in locals() else []
+l16 = default_line16 if 'default_line16' in locals() else []
+
+# Employee Part I data
+emp_row = emp_demo[emp_demo['employeeid'] == sel_id]
+full_name = ""
+emp_ssn = addr = city = state_zip = ""
+if not emp_row.empty:
+    fn = str(emp_row.iloc[0].get('firstname') or '').strip()
+    ln = str(emp_row.iloc[0].get('lastname') or '').strip()
+    full_name = (fn + (' ' if fn and ln else '') + ln).strip()
+    emp_ssn = str(emp_row.iloc[0].get('ssn') or '')
+    addr = str(emp_row.iloc[0].get('addressline1') or '')
+    city = str(emp_row.iloc[0].get('city') or '')
+    stt = str(emp_row.iloc[0].get('state') or '')
+    zc = str(emp_row.iloc[0].get('zipcode') or '')
+    state_zip = ' '.join([p for p in [stt, zc] if p])
+
+# Part II monthly codes for the selected employee
+final_row = final[final['employeeid']==sel_id].set_index('month')
+line14_map = {m: (final_row.loc[m, 'line14_final'] if m in final_row.index else '') for m in months}
+line16_map = {m: (final_row.loc[m, 'line16_final'] if m in final_row.index else '') for m in months}
+
+st.subheader("Generate & Download")
+run = st.button("Generate PDF for selected employee", type="primary")
+if run:
+    values = {}
+    # Part I (auto-mapped)
+    try:
+        if 'fld_emp_name' in locals() and fld_emp_name and full_name:
+            values[fld_emp_name] = full_name
+        if 'fld_emp_ssn' in locals() and fld_emp_ssn and emp_ssn:
+            values[fld_emp_ssn] = emp_ssn
+        if 'fld_emp_address' in locals() and fld_emp_address and addr:
+            values[fld_emp_address] = addr
+        if 'fld_emp_city' in locals() and fld_emp_city and city:
+            values[fld_emp_city] = city
+        if 'fld_emp_state_zip' in locals() and fld_emp_state_zip and state_zip:
+            values[fld_emp_state_zip] = state_zip
+        if 'fld_plan_start' in locals() and fld_plan_start:
+            values[fld_plan_start] = f"{1:02d}"
+    except Exception:
+        pass
+
+    # Part II (Line 14/16 + optional Line 15)
+    for i, m in enumerate(months):
+        if i < len(l14) and l14[i]:
+            values[l14[i]] = line14_map.get(m, '')
+        if i < len(l16) and l16[i]:
+            values[l16[i]] = line16_map.get(m, '')
+        if opt_line15_from_pay and i < len(months):
+            # If user mapped Line 15 via UI earlier we would add it here; for auto we skip unless found
+            pass
+
+    # Create outputs
+    fillable_bytes = fill_pdf_fields(pdf_bytes, values, flatten=False)
+    st.download_button("Download filled (fillable) PDF", data=fillable_bytes, file_name=f"1095C_{sel_id}_fillable.pdf", mime="application/pdf")
+    if opt_flatten or not all_fields:
+        flat_bytes = fill_pdf_fields(fillable_bytes, values, flatten=True)
+        st.download_button("Download flattened (printed) PDF", data=flat_bytes, file_name=f"1095C_{sel_id}_flattened.pdf", mime="application/pdf")
+
+# Bulk generation helper (zip)
+st.subheader("Bulk Generate (optional)")
+st.caption("Generate for all employees using auto-mapped fields. Produces a .zip with one PDF per employee.")
+if st.button("Generate Zip for All Employees"):
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for eid in interim['employeeid'].drop_duplicates().tolist():
+            # employee info
+            er = emp_demo[emp_demo['employeeid']==eid]
+            full = ""; ssn2=""; addr2=""; city2=""; statezip2=""
+            if not er.empty:
+                fn2 = str(er.iloc[0].get('firstname') or '')
+                ln2 = str(er.iloc[0].get('lastname') or '')
+                full = (fn2 + (' ' if fn2 and ln2 else '') + ln2).strip()
+                ssn2 = str(er.iloc[0].get('ssn') or '')
+                addr2 = str(er.iloc[0].get('addressline1') or '')
+                city2 = str(er.iloc[0].get('city') or '')
+                st2 = str(er.iloc[0].get('state') or '')
+                z2 = str(er.iloc[0].get('zipcode') or '')
+                statezip2 = ' '.join([p for p in [st2, z2] if p])
+            fr = final[final['employeeid']==eid].set_index('month')
+            l14m = {m: (fr.loc[m, 'line14_final'] if m in fr.index else '') for m in months}
+            l16m = {m: (fr.loc[m, 'line16_final'] if m in fr.index else '') for m in months}
+            vals = {}
+            if 'fld_emp_name' in locals() and fld_emp_name and full:
+                vals[fld_emp_name] = full
+            if 'fld_emp_ssn' in locals() and fld_emp_ssn and ssn2:
+                vals[fld_emp_ssn] = ssn2
+            if 'fld_emp_address' in locals() and fld_emp_address and addr2:
+                vals[fld_emp_address] = addr2
+            if 'fld_emp_city' in locals() and fld_emp_city and city2:
+                vals[fld_emp_city] = city2
+            if 'fld_emp_state_zip' in locals() and fld_emp_state_zip and statezip2:
+                vals[fld_emp_state_zip] = statezip2
+            if 'fld_plan_start' in locals() and fld_plan_start:
+                vals[fld_plan_start] = f"{1:02d}"
+            for i, m in enumerate(months):
+                if i < len(l14) and l14[i]:
+                    vals[l14[i]] = l14m.get(m, '')
+                if i < len(l16) and l16[i]:
+                    vals[l16[i]] = l16m.get(m, '')
+            filled = fill_pdf_fields(pdf_bytes, vals, flatten=False)
+            if opt_flatten or not all_fields:
+                filled = fill_pdf_fields(filled, vals, flatten=True)
+            zf.writestr(f"1095C_{eid}.pdf", filled)
+    st.download_button("Download ZIP", data=buf.getvalue(), file_name="1095C_all_employees.zip", mime="application/zip")
