@@ -16,6 +16,7 @@
 #   2) streamlit run app.py
 
 import io
+import re
 import calendar
 from datetime import datetime
 from typing import Dict, List, Tuple
@@ -530,6 +531,74 @@ def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
     doc.save(out)
     return out.getvalue()
 
+# ---- Part I STRICT field fill (preferred), with overlay fallback --------------
+
+def _format_ssn(s: str) -> str:
+    ds = re.sub(r"\D", "", str(s or ""))
+    return f"{ds[:3]}-{ds[3:5]}-{ds[5:9]}" if len(ds) == 9 else (s or "")
+
+def fill_part1_fields_strict(pdf_bytes: bytes, part1: dict) -> (bytes, bool):
+    """
+    Try to fill real AcroForm fields for Part I using pdfrw.
+    Returns (new_pdf_bytes, filled_any: bool)
+      part1 keys: name, ssn, address, city, state, countryzip, plan
+    """
+    # Common field-name variants seen in IRS 1095-C templates
+    CANDS = {
+        "name":      ["f1_1[0]", "employeename[0]", "employee_name", "name", "employee name"],
+        "ssn":       ["f1_2[0]", "ssn", "employee_ssn", "employeesocialsecuritynumber[0]"],
+        "address":   ["f1_3[0]", "address[0]", "streetaddress[0]", "address1", "street"],
+        "city":      ["f1_4[0]", "city[0]", "cityortown", "city_or_town"],
+        "state":     ["f1_5[0]", "state[0]", "province", "state_or_province"],
+        "countryzip":["f1_6[0]", "zip[0]", "postalcode", "country_zip", "countryandzip", "country and zip"],
+        "plan":      ["f1_7[0]", "planstartmonth[0]", "plan start month"]
+    }
+    lower_cands = {k: [v.lower() for v in vals] for k, vals in CANDS.items()}
+
+    r = PdfReader(io.BytesIO(pdf_bytes))
+    filled = 0
+
+    for page in getattr(r, "pages", []):
+        annots = getattr(page, "Annots", None)
+        if not annots:
+            continue
+        for a in annots:
+            if getattr(a, "Subtype", None) != "/Widget" or not getattr(a, "T", None):
+                continue
+            key = str(a.T)[1:-1]
+            k = key.lower()
+
+            def matches(cands):
+                # allow exact or suffix match (some tools prefix hierarchies)
+                return any(k == c or k.endswith(c) for c in cands)
+
+            # find which logical field this is
+            target = None
+            for logical, cands in lower_cands.items():
+                if matches(cands):
+                    target = logical
+                    break
+
+            if not target:
+                continue
+
+            val = (part1.get(target) or "").strip()
+            if not val:
+                continue
+            if target == "ssn":
+                val = _format_ssn(val)
+
+            a.V = val
+            a.AP = None
+            filled += 1
+
+    # Ensure NeedAppearances so values render in viewers
+    if hasattr(r, "Root") and getattr(r.Root, "AcroForm", None):
+        r.Root.AcroForm.update(dict(NeedAppearances=True))
+
+    out = io.BytesIO()
+    PdfWriter().write(out, r)
+    return out.getvalue(), filled > 0
 
 # ---------------------- App ----------------------
 
@@ -546,8 +615,8 @@ with st.sidebar:
     opt_flatten = st.checkbox("Also output a flattened copy (printed text)", value=True)
     opt_line15_from_pay = st.checkbox("Populate Line 15 from Pay Deductions (if present)", value=True)
     opt_overlay_part1 = st.checkbox(
-        "Use anchor overlay for Part I (recommended)", value=True,
-        help="Prints Part I values next to labels in the left column. Avoids fragile field-name guessing."
+        "Use anchor overlay for Part I (fallback)", value=True,
+        help="If the PDF lacks Part I fields, prints values next to labels in the left column."
     )
 
 if excel_file is None:
@@ -611,7 +680,7 @@ if opt_line15_from_pay and not pay_ded.empty and 'employeeid' in pay_ded.columns
 
 st.divider()
 
-# PDF mapping (Part II auto; Part I via overlay)
+# PDF mapping (Part II auto; Part I strict field fill -> overlay fallback)
 st.subheader("PDF Field Mapping (Part I + Part II)")
 if pdf_file is None:
     st.info("Upload a fillable 1095-C PDF to enable generation.")
@@ -636,7 +705,7 @@ else:
 
 # Compose Part I strings
 emp_row = emp_demo[emp_demo['employeeid'] == sel_id]
-full_name = emp_ssn = addr = city = state_zip = ""
+full_name = emp_ssn = addr = city = state_zip = state_only = ""
 if not emp_row.empty:
     fn = str(emp_row.iloc[0].get('firstname') or '').strip()
     ln = str(emp_row.iloc[0].get('lastname') or '').strip()
@@ -646,6 +715,7 @@ if not emp_row.empty:
     city      = str(emp_row.iloc[0].get('city') or '')
     stt       = str(emp_row.iloc[0].get('state') or '')
     zc        = str(emp_row.iloc[0].get('zipcode') or '')
+    state_only = stt
     state_zip = ' '.join([p for p in [stt, zc] if p])
 
 # ---------- Generate & Download ----------
@@ -653,39 +723,66 @@ st.subheader("Generate & Download")
 run = st.button("Generate PDF for selected employee", type="primary")
 if run:
     values = {}
-    # Part II
+    # Part II (unchanged)
     for i, m in enumerate(months):
         if i < len(default_line14) and default_line14[i]:
             values[default_line14[i]] = line14_map.get(m, '')
         if i < len(default_line16) and default_line16[i]:
             values[default_line16[i]] = line16_map.get(m, '')
-    # Optionally add Line 15 here if mapped in your template (not auto-mapped by default)
-
-    # Fill fields, then overlay Part I
     fillable_bytes = fill_pdf_fields(pdf_bytes, values, flatten=False)
-    if opt_overlay_part1:
-        part1_vals = {"name": full_name, "ssn": emp_ssn, "address": addr,
-                      "city": city, "statezip": state_zip, "plan": f"{1:02d}"}
-        fillable_bytes = overlay_part1_by_anchors(fillable_bytes, part1_vals)
 
-    st.download_button("Download filled (fillable) PDF", data=fillable_bytes,
-                       file_name=f"1095C_{sel_id}_fillable.pdf", mime="application/pdf")
+    # ---- Part I: try STRICT FIELD FILL first; fallback to overlay if needed ----
+    part1_vals = {
+        "name": full_name,
+        "ssn": emp_ssn,
+        "address": addr,
+        "city": city,
+        "state": state_only,
+        "countryzip": state_zip,
+        "plan": f"{1:02d}",   # Jan by default; adjust as needed
+    }
+
+    strict_bytes, ok = fill_part1_fields_strict(fillable_bytes, part1_vals)
+    if ok:
+        fillable_bytes = strict_bytes
+    elif opt_overlay_part1:
+        overlay_vals = {
+            "name": part1_vals["name"],
+            "ssn": _format_ssn(part1_vals["ssn"]),
+            "address": part1_vals["address"],
+            "city": part1_vals["city"],
+            "statezip": part1_vals["countryzip"],
+            "plan": part1_vals["plan"],
+        }
+        fillable_bytes = overlay_part1_by_anchors(fillable_bytes, overlay_vals)
+
+    # Download buttons
+    st.download_button(
+        "Download filled (fillable) PDF",
+        data=fillable_bytes,
+        file_name=f"1095C_{sel_id}_fillable.pdf",
+        mime="application/pdf",
+    )
 
     if opt_flatten or not all_fields:
         flat_bytes = fill_pdf_fields(fillable_bytes, values, flatten=True)
-        st.download_button("Download flattened (printed) PDF", data=flat_bytes,
-                           file_name=f"1095C_{sel_id}_flattened.pdf", mime="application/pdf")
+        st.download_button(
+            "Download flattened (printed) PDF",
+            data=flat_bytes,
+            file_name=f"1095C_{sel_id}_flattened.pdf",
+            mime="application/pdf",
+        )
 
 # ---------- Bulk ZIP ----------
 st.subheader("Bulk Generate (optional)")
-st.caption("Generates a .zip with one PDF per employee using Part I overlay + Part II auto-mapping.")
+st.caption("Generates a .zip with one PDF per employee using Part I strict fill (or overlay fallback) + Part II auto-mapping.")
 if st.button("Generate Zip for All Employees"):
     import zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         for eid in interim['employeeid'].drop_duplicates().tolist():
             er = emp_demo[emp_demo['employeeid']==eid]
-            full = ssn2 = addr2 = city2 = statezip2 = ""
+            full = ssn2 = addr2 = city2 = st2 = z2 = statezip2 = ""
             if not er.empty:
                 fn2 = str(er.iloc[0].get('firstname') or '')
                 ln2 = str(er.iloc[0].get('lastname') or '')
@@ -709,10 +806,23 @@ if st.button("Generate Zip for All Employees"):
                     vals[default_line16[i]] = l16m.get(m, '')
 
             filled = fill_pdf_fields(pdf_bytes, vals, flatten=False)
-            if opt_overlay_part1:
-                pvals = {"name": full, "ssn": ssn2, "address": addr2,
-                         "city": city2, "statezip": statezip2, "plan": f"{1:02d}"}
-                filled = overlay_part1_by_anchors(filled, pvals)
+
+            pvals = {"name": full, "ssn": ssn2, "address": addr2,
+                     "city": city2, "state": st2, "countryzip": statezip2, "plan": f"{1:02d}"}
+
+            strict_bytes, ok = fill_part1_fields_strict(filled, pvals)
+            if ok:
+                filled = strict_bytes
+            elif opt_overlay_part1:
+                filled = overlay_part1_by_anchors(filled, {
+                    "name": pvals["name"],
+                    "ssn": _format_ssn(pvals["ssn"]),
+                    "address": pvals["address"],
+                    "city": pvals["city"],
+                    "statezip": pvals["countryzip"],
+                    "plan": pvals["plan"],
+                })
+
             if opt_flatten or not all_fields:
                 filled = fill_pdf_fields(filled, vals, flatten=True)
             zf.writestr(f"1095C_{eid}.pdf", filled)
