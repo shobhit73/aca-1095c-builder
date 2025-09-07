@@ -1,5 +1,4 @@
-# app.py — ACA 1095-C PDF Generator (Employee-by-Employee)
-# Streamlit app: upload Excel + a fillable 1095-C PDF, compute Line14/16, and fill Part I & Part II.
+# app.py — ACA 1095-C PDF Generator (Two-step: Part II first, then optional Part I)
 #
 # Requirements (root requirements.txt):
 #   streamlit>=1.36
@@ -11,9 +10,7 @@
 #   reportlab>=4.0
 #   pymupdf>=1.24
 #
-# How to run locally:
-#   1) pip install -r requirements.txt
-#   2) streamlit run app.py
+# Run: streamlit run app.py
 
 import io
 import re
@@ -25,13 +22,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from pdfrw import PdfReader, PdfWriter, PageMerge, PdfDict
 from dateutil.parser import parse as dtparse  # noqa: F401
+from pdfrw import PdfReader, PdfWriter, PageMerge, PdfDict
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter  # noqa: F401
 import fitz  # PyMuPDF — used for robust Part I overlay by labels/widgets
 
-st.set_page_config(page_title="ACA 1095-C Builder", layout="wide")
+st.set_page_config(page_title="ACA 1095-C Builder (Two-Step)", layout="wide")
 
 # ---------------------- Cleaning & Parsing ----------------------
 
@@ -384,7 +381,7 @@ def fill_pdf_fields(pdf_bytes: bytes, values: Dict[str, str], flatten: bool=Fals
     bout = io.BytesIO(); writer.write(bout)
     return bout.getvalue()
 
-# ---- Widget geometry for auto-mapping (and overlay helpers) -----------------
+# ---- Widget geometry for auto-mapping (Part II) -----------------
 
 def extract_pdf_widgets(pdf_bytes: bytes):
     try:
@@ -436,48 +433,36 @@ def auto_map_fields(pdf_bytes: bytes):
         return l14, l16
     return [], []
 
-# ---- Part I Anchor Overlay: robust placement into left-column widgets --------
+# ---- Part I Anchor Overlay (fallback) --------
 
 def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
     """
-    Robust Part I overlay:
-      • Find the printed label (e.g., '1 Name of employee')
-      • Find the employer-side widget on the same row to COPY its y-bounds
-      • Draw inside the LEFT column (label→midline), centered in that row
-    keys in values: name, ssn, address, city, statezip, plan
+    Draw Part I text near labels in left column.
+    keys: name, ssn, address, city, statezip, plan
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
     W = page.rect.width
-    mid_x = W / 2.0  # split left (employee) vs right (employer)
+    mid_x = W / 2.0
 
-    # All widgets on page 1
     widgets = [w for w in extract_pdf_widgets(pdf_bytes) if w.get("page") == 0]
 
     def yc_of(w): return (w["y1"] + w["y2"]) / 2.0
     def label_cy(r): return (r.y0 + r.y1) / 2.0
 
-    # Helper: nearest employer-side widget on same row (to copy y1..y2)
     def same_row_employer_band(r, tol=12):
         cy = label_cy(r)
-        cands = [w for w in widgets
-                 if abs(yc_of(w) - cy) <= tol and w["xc"] > mid_x + 6]
-        if not cands:
-            return None
-        # pick the leftmost on the employer side (closest to midline)
+        cands = [w for w in widgets if abs(yc_of(w) - cy) <= tol and w["xc"] > mid_x + 6]
+        if not cands: return None
         cands.sort(key=lambda w: w["x1"])
         return cands[0]
 
-    # Helper: final left-column box for drawing
     def left_cell_box(label_rect, emp_widget):
-        # x bounds: from just right of label to just left of midline
         x1 = max(label_rect.x1 + 6, 36)
         x2 = mid_x - 12
-        # y bounds: copy employer widget row if possible; otherwise shift below label
         if emp_widget:
             y1, y2 = emp_widget["y1"], emp_widget["y2"]
         else:
-            # fallback ~ one text line below the label
             y1 = label_rect.y0 + 10
             y2 = label_rect.y0 + 22
         return fitz.Rect(x1, y1, x2, y2)
@@ -497,27 +482,21 @@ def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
                 return hits[0]
         return None
 
-    # Draw Name/SSN/Address/City/State+ZIP
     for terms, key in LABELS:
         val = (values.get(key) or "").strip()
-        if not val:
-            continue
+        if not val: continue
         r = find_first(terms)
-        if not r:
-            continue
+        if not r: continue
         emp_band = same_row_employer_band(r)
         box = left_cell_box(r, emp_band)
         page.insert_textbox(box, val, fontsize=9, fontname="helv", align=0)
 
-    # Plan Start Month (small box right of the label)
     r_ps = find_first(["Plan Start Month", "Plan Start"])
     psv = (values.get("plan") or "").strip()
     if r_ps and psv:
-        # prefer a small employer-side widget in same row
         emp_ps = None
         cy = label_cy(r_ps)
-        cands = [w for w in widgets
-                 if abs(yc_of(w) - cy) <= 12 and w["x1"] > (r_ps.x1 + 4) and (w["x2"] - w["x1"]) < 60]
+        cands = [w for w in widgets if abs(yc_of(w) - cy) <= 12 and w["x1"] > (r_ps.x1 + 4) and (w["x2"] - w["x1"]) < 60]
         if cands:
             cands.sort(key=lambda w: w["x1"])
             emp_ps = cands[0]
@@ -531,13 +510,12 @@ def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
     doc.save(out)
     return out.getvalue()
 
-# ---- Part I STRICT field fill (preferred), with overlay fallback --------------
+# ---- Part I STRICT field fill (preferred) --------------
 
 def _format_ssn(s: str) -> str:
     ds = re.sub(r"\D", "", str(s or ""))
     return f"{ds[:3]}-{ds[3:5]}-{ds[5:9]}" if len(ds) == 9 else (s or "")
 
-# replace your existing fill_part1_fields_strict with this version
 def fill_part1_fields_strict(pdf_bytes: bytes, part1: dict) -> (bytes, bool):
     """
     Try to fill real AcroForm fields for Part I using pdfrw.
@@ -581,17 +559,14 @@ def fill_part1_fields_strict(pdf_bytes: bytes, part1: dict) -> (bytes, bool):
                 continue
 
             val = (part1.get(target) or "").strip()
-            if not val:
-                continue
-            if target == "ssn":
-                ds = re.sub(r"\D", "", val)
-                val = f"{ds[:3]}-{ds[3:5]}-{ds[5:9]}" if len(ds) == 9 else val
+            if not val: continue
+            if target == "ssn": val = _format_ssn(val)
 
             a.V = val
             a.AP = None
             filled += 1
 
-    # ✅ Use PdfDict, not dict — and create AcroForm if missing
+    # Ensure NeedAppearances (use PdfDict!)
     if not getattr(r.Root, "AcroForm", None):
         r.Root.AcroForm = PdfDict()
     r.Root.AcroForm.update(PdfDict(NeedAppearances=True))
@@ -600,28 +575,32 @@ def fill_part1_fields_strict(pdf_bytes: bytes, part1: dict) -> (bytes, bool):
     PdfWriter().write(out, r)
     return out.getvalue(), filled > 0
 
-
 # ---------------------- App ----------------------
 
-st.title("ACA 1095-C Builder")
-st.caption("Upload your ACA workbook + a fillable IRS 1095-C. We compute Line 14/16 and generate PDFs.")
+# Keep state between the two steps
+if "part2_pdf_bytes" not in st.session_state:
+    st.session_state.part2_pdf_bytes = None
+if "part2_fields" not in st.session_state:
+    st.session_state.part2_fields = None
+
+st.title("ACA 1095-C Builder — Two-Step")
+st.caption("Step 1: Generate Part II only. Step 2 (optional): Add Part I on top of the generated Part II PDF.")
 
 with st.sidebar:
     st.header("1) Upload Inputs")
     excel_file = st.file_uploader("Excel ACA workbook", type=["xlsx","xlsm","xls"], accept_multiple_files=False)
-    pdf_file   = st.file_uploader("Fillable 1095-C PDF (sample/template)", type=["pdf"], accept_multiple_files=False)
+    template_pdf = st.file_uploader("Fillable 1095-C PDF (template)", type=["pdf"], accept_multiple_files=False)
     st.caption("Tip: official IRS fillable PDFs work best.")
 
     st.header("2) Options")
     opt_flatten = st.checkbox("Also output a flattened copy (printed text)", value=True)
     opt_line15_from_pay = st.checkbox("Populate Line 15 from Pay Deductions (if present)", value=True)
     opt_overlay_part1 = st.checkbox(
-        "Use anchor overlay for Part I (fallback)", value=True,
-        help="If the PDF lacks Part I fields, prints values next to labels in the left column."
+        "Use overlay for Part I when strict field-fill is unavailable", value=True
     )
 
-if excel_file is None:
-    st.info("Upload your Excel workbook to begin.")
+if excel_file is None or template_pdf is None:
+    st.info("Upload your Excel workbook and a fillable PDF template to begin.")
     st.stop()
 
 with st.spinner("Reading and preparing inputs…"):
@@ -647,22 +626,29 @@ emp_options = (
     .drop_duplicates('employeeid')
     .assign(label=lambda d: d.apply(lambda r: f"{r['employeeid']} — {str(r.get('firstname') or '')} {str(r.get('lastname') or '')}".strip(), axis=1))
 )
-sel = st.selectbox("Choose an employee to generate PDF", emp_options['label'].tolist())
-sel_id = sel.split(' — ')[0]
+sel_label = st.selectbox("Choose an employee", emp_options['label'].tolist())
+sel_id = sel_label.split(' — ')[0]
 
-# Display monthly codes for selected employee
+# Compose Part I strings for later (Step 2)
+emp_row = emp_demo[emp_demo['employeeid'] == sel_id]
+full_name = emp_ssn = addr = city = state_only = state_zip = ""
+if not emp_row.empty:
+    fn = str(emp_row.iloc[0].get('firstname') or '').strip()
+    ln = str(emp_row.iloc[0].get('lastname') or '').strip()
+    full_name = (fn + (' ' if fn and ln else '') + ln).strip()
+    emp_ssn   = str(emp_row.iloc[0].get('ssn') or '')
+    addr      = str(emp_row.iloc[0].get('addressline1') or '')
+    city      = str(emp_row.iloc[0].get('city') or '')
+    stt       = str(emp_row.iloc[0].get('state') or '')
+    zc        = str(emp_row.iloc[0].get('zipcode') or '')
+    state_only = stt
+    state_zip = ' '.join([p for p in [stt, zc] if p])
+
+# Prepare Part II maps for the chosen employee
 months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 final_row = final[final['employeeid']==sel_id].set_index('month')
 line14_map = {m: (final_row.loc[m, 'line14_final'] if m in final_row.index else '') for m in months}
 line16_map = {m: (final_row.loc[m, 'line16_final'] if m in final_row.index else '') for m in months}
-
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("**Line 14 (Offer) by month**")
-    st.table(pd.DataFrame([line14_map], index=['line14_final']))
-with c2:
-    st.markdown("**Line 16 (Relief) by month**")
-    st.table(pd.DataFrame([line16_map], index=['line16_final']))
 
 # Optional Line 15 from Pay Deductions
 line15 = {m: '' for m in months}
@@ -681,151 +667,110 @@ if opt_line15_from_pay and not pay_ded.empty and 'employeeid' in pay_ded.columns
 
 st.divider()
 
-# PDF mapping (Part II auto; Part I strict field fill -> overlay fallback)
-st.subheader("PDF Field Mapping (Part I + Part II)")
-if pdf_file is None:
-    st.info("Upload a fillable 1095-C PDF to enable generation.")
-    st.stop()
+# =========================
+# STEP 1 — Generate Part II only
+# =========================
+st.header("Step 1 — Generate Part II only")
 
-pdf_bytes = pdf_file.read()
-all_fields = extract_pdf_fields(pdf_bytes)
-if not all_fields:
-    st.warning("No form fields detected. We'll still generate a flattened overlay copy.")
+template_pdf_bytes = template_pdf.read()
+all_fields = extract_pdf_fields(template_pdf_bytes)
 with st.expander("Detected PDF fields (raw)"):
     st.write(all_fields)
 
-# Auto-map Part II
-auto_l14, auto_l16 = auto_map_fields(pdf_bytes) if all_fields else ([], [])
+auto_l14, auto_l16 = auto_map_fields(template_pdf_bytes) if all_fields else ([], [])
 if auto_l14 and auto_l16:
     default_line14, default_line16 = auto_l14, auto_l16
-    st.success("Auto-mapped Line 14 & Line 16 fields from PDF layout.")
+    st.success("Auto-mapped Line 14 & Line 16 fields.")
 else:
     default_line14 = all_fields[:12] if len(all_fields) >= 12 else []
     rest = all_fields[12:] if len(all_fields) > 12 else []
     default_line16 = rest[:12] if len(rest) >= 12 else []
 
-# Compose Part I strings
-emp_row = emp_demo[emp_demo['employeeid'] == sel_id]
-full_name = emp_ssn = addr = city = state_zip = state_only = ""
-if not emp_row.empty:
-    fn = str(emp_row.iloc[0].get('firstname') or '').strip()
-    ln = str(emp_row.iloc[0].get('lastname') or '').strip()
-    full_name = (fn + (' ' if fn and ln else '') + ln).strip()
-    emp_ssn   = str(emp_row.iloc[0].get('ssn') or '')
-    addr      = str(emp_row.iloc[0].get('addressline1') or '')
-    city      = str(emp_row.iloc[0].get('city') or '')
-    stt       = str(emp_row.iloc[0].get('state') or '')
-    zc        = str(emp_row.iloc[0].get('zipcode') or '')
-    state_only = stt
-    state_zip = ' '.join([p for p in [stt, zc] if p])
+gen_part2 = st.button("Generate Part II (only)", type="primary")
+if gen_part2:
+    with st.spinner("Filling Part II…"):
+        values = {}
+        for i, m in enumerate(months):
+            if i < len(default_line14) and default_line14[i]:
+                values[default_line14[i]] = line14_map.get(m, '')
+            if i < len(default_line16) and default_line16[i]:
+                values[default_line16[i]] = line16_map.get(m, '')
+        # (Optional) include Line 15 mapping here if your template exposes those fields.
+        part2_bytes = fill_pdf_fields(template_pdf_bytes, values, flatten=False)
+        st.session_state.part2_pdf_bytes = part2_bytes
+        st.session_state.part2_fields = (default_line14, default_line16)
+    st.success("Part II PDF created and stored in session.")
+    st.download_button("Download Part II (fillable)", data=st.session_state.part2_pdf_bytes,
+                       file_name=f"1095C_{sel_id}_PART2_only.pdf", mime="application/pdf")
 
-# ---------- Generate & Download ----------
-st.subheader("Generate & Download")
-run = st.button("Generate PDF for selected employee", type="primary")
-if run:
-    values = {}
-    # Part II (unchanged)
-    for i, m in enumerate(months):
-        if i < len(default_line14) and default_line14[i]:
-            values[default_line14[i]] = line14_map.get(m, '')
-        if i < len(default_line16) and default_line16[i]:
-            values[default_line16[i]] = line16_map.get(m, '')
-    fillable_bytes = fill_pdf_fields(pdf_bytes, values, flatten=False)
+    if opt_flatten:
+        flat = fill_pdf_fields(st.session_state.part2_pdf_bytes, {}, flatten=True)
+        st.download_button("Download Part II (flattened)", data=flat,
+                           file_name=f"1095C_{sel_id}_PART2_only_flattened.pdf", mime="application/pdf")
 
-    # ---- Part I: try STRICT FIELD FILL first; fallback to overlay if needed ----
-    part1_vals = {
-        "name": full_name,
-        "ssn": emp_ssn,
-        "address": addr,
-        "city": city,
-        "state": state_only,
-        "countryzip": state_zip,
-        "plan": f"{1:02d}",   # Jan by default; adjust as needed
-    }
+st.divider()
 
-    strict_bytes, ok = fill_part1_fields_strict(fillable_bytes, part1_vals)
-    if ok:
-        fillable_bytes = strict_bytes
-    elif opt_overlay_part1:
-        overlay_vals = {
-            "name": part1_vals["name"],
-            "ssn": _format_ssn(part1_vals["ssn"]),
-            "address": part1_vals["address"],
-            "city": part1_vals["city"],
-            "statezip": part1_vals["countryzip"],
-            "plan": part1_vals["plan"],
-        }
-        fillable_bytes = overlay_part1_by_anchors(fillable_bytes, overlay_vals)
+# =========================
+# STEP 2 — Optional Part I (independent of Step 1 success)
+# =========================
+st.header("Step 2 — (Optional) Add Part I onto an existing PDF")
 
-    # Download buttons
-    st.download_button(
-        "Download filled (fillable) PDF",
-        data=fillable_bytes,
-        file_name=f"1095C_{sel_id}_fillable.pdf",
-        mime="application/pdf",
-    )
+# Allow user to choose the base PDF for Part I:
+use_session = st.radio(
+    "Choose source PDF for Part I:",
+    ["Use Part II generated in Step 1 (session)", "Upload a PDF to add Part I"],
+    index=0
+)
 
-    if opt_flatten or not all_fields:
-        flat_bytes = fill_pdf_fields(fillable_bytes, values, flatten=True)
-        st.download_button(
-            "Download flattened (printed) PDF",
-            data=flat_bytes,
-            file_name=f"1095C_{sel_id}_flattened.pdf",
-            mime="application/pdf",
-        )
+uploaded_override = None
+if use_session == "Upload a PDF to add Part I":
+    uploaded_override = st.file_uploader("Upload a PDF (e.g., the Part II-only PDF)", type=["pdf"], accept_multiple_files=False)
 
-# ---------- Bulk ZIP ----------
-st.subheader("Bulk Generate (optional)")
-st.caption("Generates a .zip with one PDF per employee using Part I strict fill (or overlay fallback) + Part II auto-mapping.")
-if st.button("Generate Zip for All Employees"):
-    import zipfile
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for eid in interim['employeeid'].drop_duplicates().tolist():
-            er = emp_demo[emp_demo['employeeid']==eid]
-            full = ssn2 = addr2 = city2 = st2 = z2 = statezip2 = ""
-            if not er.empty:
-                fn2 = str(er.iloc[0].get('firstname') or '')
-                ln2 = str(er.iloc[0].get('lastname') or '')
-                full = (fn2 + (' ' if fn2 and ln2 else '') + ln2).strip()
-                ssn2 = str(er.iloc[0].get('ssn') or '')
-                addr2 = str(er.iloc[0].get('addressline1') or '')
-                city2 = str(er.iloc[0].get('city') or '')
-                st2   = str(er.iloc[0].get('state') or '')
-                z2    = str(er.iloc[0].get('zipcode') or '')
-                statezip2 = ' '.join([p for p in [st2, z2] if p])
+# Display Part I values we’ll use
+st.markdown("**Part I values preview**")
+st.write({
+    "name": full_name, "ssn": emp_ssn, "address": addr,
+    "city": city, "state": state_only, "countryzip": state_zip, "plan": f"{1:02d}"
+})
 
-            fr = final[final['employeeid']==eid].set_index('month')
-            l14m = {m: (fr.loc[m, 'line14_final'] if m in fr.index else '') for m in months}
-            l16m = {m: (fr.loc[m, 'line16_final'] if m in fr.index else '') for m in months}
+run_part1 = st.button("Add Part I now")
+if run_part1:
+    # Choose base bytes
+    if uploaded_override is not None:
+        base_bytes = uploaded_override.read()
+    else:
+        base_bytes = st.session_state.part2_pdf_bytes
 
-            vals = {}
-            for i, m in enumerate(months):
-                if i < len(default_line14) and default_line14[i]:
-                    vals[default_line14[i]] = l14m.get(m, '')
-                if i < len(default_line16) and default_line16[i]:
-                    vals[default_line16[i]] = l16m.get(m, '')
+    if not base_bytes:
+        st.error("No base PDF available. Generate Part II first, or upload a PDF above.")
+    else:
+        with st.spinner("Adding Part I…"):
+            part1_vals = {
+                "name": full_name,
+                "ssn": emp_ssn,
+                "address": addr,
+                "city": city,
+                "state": state_only,
+                "countryzip": state_zip,
+                "plan": f"{1:02d}",
+            }
+            strict_bytes, ok = fill_part1_fields_strict(base_bytes, part1_vals)
+            out_bytes = strict_bytes if ok else (
+                overlay_part1_by_anchors(base_bytes, {
+                    "name": part1_vals["name"],
+                    "ssn": _format_ssn(part1_vals["ssn"]),
+                    "address": part1_vals["address"],
+                    "city": part1_vals["city"],
+                    "statezip": part1_vals["countryzip"],
+                    "plan": part1_vals["plan"],
+                }) if opt_overlay_part1 else base_bytes
+            )
 
-            filled = fill_pdf_fields(pdf_bytes, vals, flatten=False)
+        st.success("Part I added.")
+        st.download_button("Download PDF (Part II + Part I)", data=out_bytes,
+                           file_name=f"1095C_{sel_id}_PART2_plus_PART1.pdf", mime="application/pdf")
 
-            pvals = {"name": full, "ssn": ssn2, "address": addr2,
-                     "city": city2, "state": st2, "countryzip": statezip2, "plan": f"{1:02d}"}
-
-            strict_bytes, ok = fill_part1_fields_strict(filled, pvals)
-            if ok:
-                filled = strict_bytes
-            elif opt_overlay_part1:
-                filled = overlay_part1_by_anchors(filled, {
-                    "name": pvals["name"],
-                    "ssn": _format_ssn(pvals["ssn"]),
-                    "address": pvals["address"],
-                    "city": pvals["city"],
-                    "statezip": pvals["countryzip"],
-                    "plan": pvals["plan"],
-                })
-
-            if opt_flatten or not all_fields:
-                filled = fill_pdf_fields(filled, vals, flatten=True)
-            zf.writestr(f"1095C_{eid}.pdf", filled)
-
-    st.download_button("Download ZIP", data=buf.getvalue(), file_name="1095C_all_employees.zip", mime="application/zip")
+        if opt_flatten:
+            flat2 = fill_pdf_fields(out_bytes, {}, flatten=True)
+            st.download_button("Download Flattened (Part II + Part I)", data=flat2,
+                               file_name=f"1095C_{sel_id}_PART2_plus_PART1_flattened.pdf", mime="application/pdf")
