@@ -431,6 +431,89 @@ def fill_pdf_fields(pdf_bytes: bytes, values: Dict[str, str], flatten: bool=Fals
     writer.write(bout)
     return bout.getvalue()
 
+# --- Auto-mapping utilities (Line 14 & 16) ------------------------------------
+# These functions detect the monthly cells for Line 14 and Line 16 by reading
+# PDF field rectangles on page 1 and grouping them into horizontal rows.
+
+def extract_pdf_widgets(pdf_bytes: bytes):
+    """Return list of widgets with name and rect coords per page."""
+    try:
+        pdf = PdfReader(io.BytesIO(pdf_bytes))
+        widgets = []
+        for p_idx, page in enumerate(pdf.pages):
+            annots = getattr(page, 'Annots', None)
+            if not annots:
+                continue
+            for a in annots:
+                if a.Subtype == '/Widget' and a.T and getattr(a, 'Rect', None):
+                    try:
+                        rect = [float(v) for v in a.Rect]
+                        x1, y1, x2, y2 = rect
+                        widgets.append({
+                            'page': p_idx,
+                            'name': str(a.T)[1:-1],
+                            'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                            'xc': (x1+x2)/2.0, 'yc': (y1+y2)/2.0,
+                        })
+                    except Exception:
+                        continue
+        return widgets
+    except Exception:
+        return []
+
+
+def _cluster_rows(widgets, y_tol: float = 8.0):
+    """Group widgets by similar Y centers (horizontal rows)."""
+    rows = []
+    for w in sorted(widgets, key=lambda z: -z['yc']):  # top to bottom
+        placed = False
+        for row in rows:
+            # compare to first element's y in the row
+            if abs(row[0]['yc'] - w['yc']) <= y_tol:
+                row.append(w)
+                placed = True
+                break
+        if not placed:
+            rows.append([w])
+    # sort each row by X ascending (left→right)
+    for row in rows:
+        row.sort(key=lambda z: z['xc'])
+    return rows
+
+
+def auto_map_fields(pdf_bytes: bytes):
+    """Return ([12 L14 field names], [12 L16 field names]) or ([], [])."""
+    widgets = extract_pdf_widgets(pdf_bytes)
+    if not widgets:
+        return [], []
+    # Only consider first page (Part II lives on page 1)
+    first = [w for w in widgets if w['page'] == 0]
+    rows = _cluster_rows(first, y_tol=10.0)
+    # Candidate rows are those with >=12 fields in a line (often 13 incl. All‑12)
+    cand = [r for r in rows if len(r) >= 12]
+    # Sort candidates by vertical position (top to bottom)
+    cand.sort(key=lambda r: -np.mean([w['yc'] for w in r]))
+    if len(cand) < 3:
+        return [], []
+
+    def pick_month_names(row):
+        names = [w['name'] for w in row]
+        # If there are 13 boxes, the leftmost is usually "All 12 Months" → drop it
+        if len(names) >= 13:
+            names = names[1:13]
+        else:
+            names = names[:12]
+        return names
+
+    line14_names = pick_month_names(cand[0])  # first row is Line 14
+    # cand[1] would be Line 15, we don't need it for auto-map here
+    line16_names = pick_month_names(cand[2])  # third row is Line 16
+
+    # Basic sanity: ensure 12 names each and not identical lists
+    if len(line14_names) == 12 and len(line16_names) == 12:
+        return line14_names, line16_names
+    return [], []
+
 # ---------------------- App ----------------------
 
 st.title("ACA 1095‑C Builder")
@@ -524,165 +607,35 @@ if not all_fields:
 with st.expander("Detected PDF fields (raw)"):
     st.write(all_fields)
 
-# Build defaults: try to guess sequential names for Line 14 and 16
-default_line14 = all_fields[:12] if len(all_fields) >= 12 else []
-rest = all_fields[12:] if len(all_fields) > 12 else []
-default_line16 = rest[:12] if len(rest) >= 12 else []
+# Build defaults: try to auto-map Line 14 & 16 from PDF layout; fallback
+auto_l14, auto_l16 = auto_map_fields(pdf_bytes) if all_fields else ([], [])
+if auto_l14 and auto_l16:
+    default_line14 = auto_l14
+    default_line16 = auto_l16
+    st.success("Auto-mapped Line 14 & Line 16 fields from PDF layout.")
+else:
+    default_line14 = all_fields[:12] if len(all_fields) >= 12 else []
+    rest = all_fields[12:] if len(all_fields) > 12 else []
+    default_line16 = rest[:12] if len(rest) >= 12 else []
 
-# Map Part I minimal fields
-st.markdown("**Part I (Employee & Employer) field mapping (optional)**")
-colA, colB, colC = st.columns(3)
-with colA:
-    fld_emp_name = st.selectbox("Employee Name (Line 1)", ["(none)"] + all_fields, index=0)
-with colB:
-    fld_emp_ssn = st.selectbox("Employee SSN (Line 2)", ["(none)"] + all_fields, index=0)
-with colC:
-    fld_plan_start = st.selectbox("Plan Start Month", ["(none)"] + all_fields, index=0)
+# --- Auto-map Part I (Employee info) fields ---
+def auto_map_part1(widgets):
+    name = ssn = addr = city = statezip = plan = None
+    if not widgets: return name, ssn, addr, city, statezip, plan
+    # crude: pick first 6 text fields near top-left of page
+    first = [w for w in widgets if w['page']==0]
+    first.sort(key=lambda w:(-w['yc'], w['xc']))
+    if len(first)>=6:
+        name = first[0]['name']
+        ssn = first[1]['name']
+        addr = first[2]['name']
+        city = first[3]['name']
+        statezip = first[4]['name']
+        plan = first[5]['name']
+    return name, ssn, addr, city, statezip, plan
 
-colD, colE, colF = st.columns(3)
-with colD:
-    fld_emp_address = st.selectbox("Employee Address (Line 3)", ["(none)"] + all_fields, index=0)
-with colE:
-    fld_emp_city = st.selectbox("Employee City (Line 4)", ["(none)"] + all_fields, index=0)
-with colF:
-    fld_emp_state_zip = st.selectbox("Employee State/ZIP (Line 5/6 combined)", ["(none)"] + all_fields, index=0)
-
-st.markdown("**Part II (Line 14 & Line 16) field mapping**")
-map_cols = st.columns(3)
-with map_cols[0]:
-    st.caption("Line 14 fields (Jan..Dec)")
-    l14 = []
-    for i, m in enumerate(months):
-        sel = st.selectbox(f"L14 {m}", ["(none)"] + all_fields, index=(all_fields.index(default_line14[i]) + 1 if i < len(default_line14) and default_line14[i] in all_fields else 0), key=f"l14_{i}")
-        l14.append(sel if sel != "(none)" else None)
-with map_cols[1]:
-    st.caption("Line 15 (optional) — if mapped and enabled")
-    l15 = []
-    for i, m in enumerate(months):
-        sel = st.selectbox(f"L15 {m}", ["(none)"] + all_fields, index=0, key=f"l15_{i}")
-        l15.append(sel if sel != "(none)" else None)
-with map_cols[2]:
-    st.caption("Line 16 fields (Jan..Dec)")
-    l16 = []
-    for i, m in enumerate(months):
-        sel = st.selectbox(f"L16 {m}", ["(none)"] + all_fields, index=(all_fields.index(default_line16[i]) + 1 if i < len(default_line16) and default_line16[i] in all_fields else 0), key=f"l16_{i}")
-        l16.append(sel if sel != "(none)" else None)
-
-st.divider()
-
-# Build values for selected employee
-emp_name = emp_demo[emp_demo['employeeid']==sel_id]
-full_name = ""
-if not emp_name.empty:
-    fn = str(emp_name.iloc[0].get('firstname') or '').strip()
-    ln = str(emp_name.iloc[0].get('lastname') or '').strip()
-    mi = ""  # not tracked
-    full_name = (fn + (" " + mi if mi else "") + (" " + ln if ln else "")).strip()
-
-# minimal address/SSN fields (optional)
-emp_ssn = str(emp_name.iloc[0].get('ssn') or '') if not emp_name.empty else ''
-addr = str(emp_name.iloc[0].get('addressline1') or '') if not emp_name.empty else ''
-city = str(emp_name.iloc[0].get('city') or '') if not emp_name.empty else ''
-state = str(emp_name.iloc[0].get('state') or '') if not emp_name.empty else ''
-zipc = str(emp_name.iloc[0].get('zipcode') or '') if not emp_name.empty else ''
-state_zip = " ".join([p for p in [state, zipc] if p])
-
-# Part II codes from final table
-final_row = final[final['employeeid']==sel_id].set_index('month')
-line14_map = {m: (final_row.loc[m, 'line14_final'] if m in final_row.index else '') for m in months}
-line16_map = {m: (final_row.loc[m, 'line16_final'] if m in final_row.index else '') for m in months}
-
-# Compose PDF values by mapping
-values = {}
-# Part I
-if fld_emp_name and fld_emp_name != "(none)" and full_name:
-    values[fld_emp_name] = full_name
-if fld_emp_ssn and fld_emp_ssn != "(none)" and emp_ssn:
-    values[fld_emp_ssn] = emp_ssn
-if fld_emp_address and fld_emp_address != "(none)" and addr:
-    values[fld_emp_address] = addr
-if fld_emp_city and fld_emp_city != "(none)" and city:
-    values[fld_emp_city] = city
-if fld_emp_state_zip and fld_emp_state_zip != "(none)" and state_zip:
-    values[fld_emp_state_zip] = state_zip
-if fld_plan_start and fld_plan_start != "(none)":
-    values[fld_plan_start] = f"{1:02d}"
-
-# Part II
-for i, m in enumerate(months):
-    if l14[i]:
-        values[l14[i]] = line14_map.get(m, '')
-    if l16[i]:
-        values[l16[i]] = line16_map.get(m, '')
-    if opt_line15_from_pay and l15[i] and line15.get(m):
-        values[l15[i]] = line15[m]
-
-col_go1, col_go2 = st.columns([1,2])
-with col_go1:
-    gen = st.button("Generate PDF for selected employee")
-
-if gen:
-    with st.spinner("Filling PDF…"):
-        fillable_bytes = fill_pdf_fields(pdf_bytes, values, flatten=False)
-        st.download_button("Download filled (fillable) PDF", data=fillable_bytes, file_name=f"1095C_{sel_id}_fillable.pdf", mime="application/pdf")
-        if opt_flatten or not all_fields:
-            flat_bytes = fill_pdf_fields(fillable_bytes, values, flatten=True)
-            st.download_button("Download flattened (printed) PDF", data=flat_bytes, file_name=f"1095C_{sel_id}_flattened.pdf", mime="application/pdf")
-
-st.divider()
-
-# Bulk generation helper (zip)
-st.subheader("Bulk Generate (optional)")
-st.caption("Generate for all employees using the same field mapping. Produces a .zip with one PDF per employee.")
-bulk = st.button("Generate Zip for All Employees")
-if bulk:
-    import zipfile
-    from tqdm import tqdm
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for eid in interim['employeeid'].drop_duplicates().tolist():
-            # recompute values for each employee
-            emp_name = emp_demo[emp_demo['employeeid']==eid]
-            fn = str(emp_name.iloc[0].get('firstname') or '') if not emp_name.empty else ''
-            ln = str(emp_name.iloc[0].get('lastname') or '') if not emp_name.empty else ''
-            full_name = (fn + ' ' + ln).strip()
-            emp_ssn = str(emp_name.iloc[0].get('ssn') or '') if not emp_name.empty else ''
-            addr = str(emp_name.iloc[0].get('addressline1') or '') if not emp_name.empty else ''
-            city = str(emp_name.iloc[0].get('city') or '') if not emp_name.empty else ''
-            state = str(emp_name.iloc[0].get('state') or '') if not emp_name.empty else ''
-            zipc = str(emp_name.iloc[0].get('zipcode') or '') if not emp_name.empty else ''
-            state_zip = " ".join([p for p in [state, zipc] if p])
-
-            final_row = final[final['employeeid']==eid].set_index('month')
-            line14_map = {m: (final_row.loc[m, 'line14_final'] if m in final_row.index else '') for m in months}
-            line16_map = {m: (final_row.loc[m, 'line16_final'] if m in final_row.index else '') for m in months}
-
-            vals = {}
-            if fld_emp_name and fld_emp_name != "(none)" and full_name:
-                vals[fld_emp_name] = full_name
-            if fld_emp_ssn and fld_emp_ssn != "(none)" and emp_ssn:
-                vals[fld_emp_ssn] = emp_ssn
-            if fld_emp_address and fld_emp_address != "(none)" and addr:
-                vals[fld_emp_address] = addr
-            if fld_emp_city and fld_emp_city != "(none)" and city:
-                vals[fld_emp_city] = city
-            if fld_emp_state_zip and fld_emp_state_zip != "(none)" and state_zip:
-                vals[fld_emp_state_zip] = state_zip
-            if fld_plan_start and fld_plan_start != "(none)":
-                vals[fld_plan_start] = f"{1:02d}"
-
-            for i, m in enumerate(months):
-                if l14[i]:
-                    vals[l14[i]] = line14_map.get(m, '')
-                if l16[i]:
-                    vals[l16[i]] = line16_map.get(m, '')
-                if opt_line15_from_pay and l15[i] and line15.get(m):
-                    vals[l15[i]] = line15[m]
-
-            filled = fill_pdf_fields(pdf_bytes, vals, flatten=False)
-            if opt_flatten or not all_fields:
-                filled = fill_pdf_fields(filled, vals, flatten=True)
-            zf.writestr(f"1095C_{eid}.pdf", filled)
-    st.download_button("Download ZIP", data=buf.getvalue(), file_name="1095C_all_employees.zip", mime="application/zip")
-
-st.caption("Built with Streamlit · Uses pdfrw/reportlab for PDF fill & flatten · Works with arbitrary fillable 1095‑C via field mapping.")
+widgets_all = extract_pdf_widgets(pdf_bytes)
+part1_map = auto_map_part1(widgets_all)
+if part1_map[0]:
+    fld_emp_name, fld_emp_ssn, fld_emp_address, fld_emp_city, fld_emp_state_zip, fld_plan_start = part1_map
+    st.success("Auto-mapped Part I employee info fields.")
