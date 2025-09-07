@@ -1,8 +1,18 @@
 # app.py — ACA 1095-C PDF Generator (Employee-by-Employee)
 # Streamlit app: upload Excel + a fillable 1095-C PDF, compute Line14/16, and fill Part I & Part II.
 #
+# Requirements (root requirements.txt):
+#   streamlit>=1.36
+#   pandas>=2.0
+#   numpy>=1.23
+#   python-dateutil>=2.8
+#   openpyxl>=3.1
+#   pdfrw>=0.4
+#   reportlab>=4.0
+#   pymupdf>=1.24
+#
 # How to run locally:
-#   1) pip install streamlit pandas numpy python-dateutil openpyxl pdfrw reportlab pymupdf
+#   1) pip install -r requirements.txt
 #   2) streamlit run app.py
 
 import io
@@ -14,11 +24,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from dateutil.parser import parse as dtparse  # noqa: F401  (kept if you add date parsing later)
+from dateutil.parser import parse as dtparse  # noqa: F401
 from pdfrw import PdfReader, PdfWriter, PageMerge
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter  # noqa: F401
-import fitz  # PyMuPDF (used for Part I anchor overlay)
+import fitz  # PyMuPDF — used for robust Part I overlay by labels/widgets
 
 st.set_page_config(page_title="ACA 1095-C Builder", layout="wide")
 
@@ -36,8 +46,9 @@ def to_bool(val) -> bool:
         return False
     return str(val).strip().lower() in BOOL_TRUE
 
+
 def parse_date_safe(d, default_end=False):
-    """Parse diverse date shapes; clamp invalid days to month-end if needed."""
+    """Parse dates; clamp invalid days to month end if needed."""
     if pd.isna(d) or d == "":
         return None
     try:
@@ -49,7 +60,7 @@ def parse_date_safe(d, default_end=False):
                 y, m = map(int, s.split("-"))
                 last = calendar.monthrange(y, m)[1]
                 return pd.to_datetime(f"{y}-{m:02d}-{last if default_end else 1}")
-            y, m, day = map(int, s.split("-"))  # YYYY-MM-DD (maybe invalid day)
+            y, m, day = map(int, s.split("-"))  # YYYY-MM-DD (maybe invalid)
             last_day = calendar.monthrange(y, m)[1]
             day = min(day, last_day)
             if default_end:
@@ -58,13 +69,16 @@ def parse_date_safe(d, default_end=False):
         except Exception:
             return None
 
+
 def month_bounds(year: int, month: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
     start = pd.Timestamp(year=year, month=month, day=1)
     end = pd.Timestamp(year=year, month=month, day=calendar.monthrange(year, month)[1])
     return start, end
 
+
 def ranges_overlap(a_start, a_end, b_start, b_end) -> bool:
     return (a_start is not None and a_end is not None and a_start <= b_end and a_end >= b_start)
+
 
 def covers_whole_month(r_start, r_end, m_start, m_end) -> bool:
     return (r_start is not None and r_end is not None and r_start <= m_start and r_end >= m_end)
@@ -80,13 +94,13 @@ def load_excel(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
         data[key] = normalize_columns(df)
     return data
 
+
 def prepare_inputs(data: Dict[str, pd.DataFrame]):
     emp_demo = data.get('emp demographic', pd.DataFrame())
     if not emp_demo.empty:
         cols = [c for c in emp_demo.columns if c in [
             'employeeid','firstname','lastname','ssn','addressline1','city','state','zipcode','country',
-            'employername','ein','employeraddress','contacttelephone','employercity','employerstate','employercountry','employerzip'
-        ]]
+            'employername','ein','employeraddress','contacttelephone','employercity','employerstate','employercountry','employerzip']]
         emp_demo = emp_demo[cols]
 
     emp_status = data.get('emp status', pd.DataFrame())
@@ -95,12 +109,12 @@ def prepare_inputs(data: Dict[str, pd.DataFrame]):
     dep_enroll = data.get('dep enrollment', pd.DataFrame())
     pay_ded    = data.get('pay deductions', pd.DataFrame())
 
-    # Coerce EmployeeID to str everywhere
+    # EmployeeID to str
     for df in [emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_ded]:
         if not df.empty and 'employeeid' in df.columns:
             df['employeeid'] = df['employeeid'].astype(str)
 
-    # Parse
+    # Status
     if not emp_status.empty:
         for c in ['statusstartdate','statusenddate']:
             if c in emp_status.columns:
@@ -110,6 +124,7 @@ def prepare_inputs(data: Dict[str, pd.DataFrame]):
         if 'role' in emp_status.columns:
             emp_status['role'] = emp_status['role'].astype(str).str.strip().str.upper()
 
+    # Eligibility
     if not emp_elig.empty:
         for c in ['eligibilitystartdate','eligibilityenddate']:
             if c in emp_elig.columns:
@@ -119,6 +134,7 @@ def prepare_inputs(data: Dict[str, pd.DataFrame]):
         mv_col = 'minimumvaluecoverage' if 'minimumvaluecoverage' in emp_elig.columns else ('mimimumvaluecoverage' if 'mimimumvaluecoverage' in emp_elig.columns else None)
         emp_elig['eligible_mv'] = emp_elig[mv_col].apply(to_bool) if mv_col else False
 
+    # Enrollment
     if not emp_enroll.empty:
         for c in ['enrollmentstartdate','enrollmentenddate']:
             if c in emp_enroll.columns:
@@ -126,6 +142,7 @@ def prepare_inputs(data: Dict[str, pd.DataFrame]):
         if 'isenrolled' in emp_enroll.columns:
             emp_enroll['isenrolled'] = emp_enroll['isenrolled'].apply(to_bool)
 
+    # Dependents
     if not dep_enroll.empty:
         for c in ['eligiblestartdate','eligibleenddate']:
             if c in dep_enroll.columns:
@@ -138,29 +155,31 @@ def prepare_inputs(data: Dict[str, pd.DataFrame]):
 
     return emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_ded
 
+
 def choose_report_year(emp_elig: pd.DataFrame) -> int:
     if emp_elig.empty or emp_elig[['eligibilitystartdate','eligibilityenddate']].dropna().empty:
         return datetime.now().year
-    yr_counts = []
+    yrs = []
     for _, r in emp_elig.dropna(subset=['eligibilitystartdate','eligibilityenddate']).iterrows():
-        years = list(range(r['eligibilitystartdate'].year, r['eligibilityenddate'].year + 1))
-        yr_counts.extend(years)
+        yrs += list(range(r['eligibilitystartdate'].year, r['eligibilityenddate'].year + 1))
+    # pick most frequent, tie -> latest
     best, best_count = None, -1
-    for y in sorted(set(yr_counts)):
-        c = yr_counts.count(y)
+    for y in sorted(set(yrs)):
+        c = yrs.count(y)
         if c > best_count or (c == best_count and y > (best or 0)):
             best, best_count = y, c
     return best or datetime.now().year
 
+
 def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year: int) -> pd.DataFrame:
-    # Build base grid
+    # Base grid
     employee_ids = set()
     for df in [emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll]:
         if not df.empty and 'employeeid' in df.columns:
             employee_ids.update(df['employeeid'].unique().tolist())
     employee_ids = sorted(list(employee_ids))
 
-    months = list(range(1, 12+1))
+    months = list(range(1, 13))
     rows = []
     for eid in employee_ids:
         for m in months:
@@ -236,7 +255,7 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year: 
         return False
     interim['enrolled_allmonth'] = interim.apply(lambda r: enrolled_allmonth(r['employeeid'], r['monthstart'], r['monthend']), axis=1)
 
-    # Dependant offers
+    # Dependents' offer flags
     def offer_dep(eid, mstart, mend, dep_type: str):
         if dep_enroll.empty or 'dependentrelationship' not in dep_enroll.columns:
             return False
@@ -249,12 +268,12 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year: 
     interim['offer_spouse']     = interim.apply(lambda r: offer_dep(r['employeeid'], r['monthstart'], r['monthend'], 'Spouse'), axis=1)
     interim['offer_dependents'] = interim.apply(lambda r: offer_dep(r['employeeid'], r['monthstart'], r['monthend'], 'Child'), axis=1)
 
-    # Waiting period proxy + Not FT all year
+    # Waiting period & not FT all year
     interim['waitingperiod_month'] = interim['employed'] & interim['ft'] & (~interim['eligibleforcoverage'])
     notft = interim.groupby('employeeid')['ft'].sum() == 0
     interim['notft_allyear'] = interim['employeeid'].map(notft)
 
-    # Line 14 mapping (use 1E vs 1A when affordability unknown)
+    # Line 14 mapping
     def map_line14(row):
         if row['offer_ee_allmonth'] and row['eligible_mv']:
             if row['offer_spouse'] and row['offer_dependents']:
@@ -268,6 +287,7 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year: 
         if row['offer_ee_allmonth'] and (not row['eligible_mv']):
             return '1F'
         return '1H'
+
     interim['line14_final'] = interim.apply(map_line14, axis=1)
 
     # Line 16 mapping priority
@@ -277,6 +297,7 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year: 
         if not row['employed']: return '2A'
         if row['employed'] and not row['ft']: return '2B'
         return ''
+
     interim['line16_final'] = interim.apply(map_line16, axis=1)
 
     cols = ['employeeid','firstname','lastname','year','monthnum','month','monthstart','monthend',
@@ -286,11 +307,10 @@ def build_interim(emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, year: 
     interim = interim[[c for c in cols if c in interim.columns]]
     return interim
 
+
 def build_final(interim: pd.DataFrame) -> pd.DataFrame:
     final = interim[['employeeid','month','line14_final','line16_final']].copy()
-    cat = pd.Categorical(final['month'],
-                         categories=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],
-                         ordered=True)
+    cat = pd.Categorical(final['month'], categories=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'], ordered=True)
     final['month'] = cat
     final = final.sort_values(['employeeid','month'])
     final['month'] = final['month'].astype(str)
@@ -314,8 +334,10 @@ def extract_pdf_fields(pdf_bytes: bytes) -> List[str]:
     except Exception:
         return []
 
+
 def fill_pdf_fields(pdf_bytes: bytes, values: Dict[str, str], flatten: bool=False) -> bytes:
     pdf = PdfReader(io.BytesIO(pdf_bytes))
+
     # Fill fields
     for page in pdf.pages:
         annots = getattr(page, 'Annots', None)
@@ -326,13 +348,13 @@ def fill_pdf_fields(pdf_bytes: bytes, values: Dict[str, str], flatten: bool=Fals
                 if key in values:
                     a.V = values[key]
                     a.AP = None
-    out_io = io.BytesIO()
-    PdfWriter().write(out_io, pdf)
+
+    out_io = io.BytesIO(); PdfWriter().write(out_io, pdf)
     out_bytes = out_io.getvalue()
     if not flatten:
         return out_bytes
 
-    # Flatten by drawing appearances
+    # Flatten: draw appearances
     pdf2 = PdfReader(io.BytesIO(out_bytes))
     page_draws = {}
     for p_idx, page in enumerate(pdf2.pages):
@@ -353,7 +375,7 @@ def fill_pdf_fields(pdf_bytes: bytes, values: Dict[str, str], flatten: bool=Fals
             buf = io.BytesIO(); c = canvas.Canvas(buf, pagesize=(w, h))
             c.setFont("Helvetica", 9)
             for (x1, y1, x2, y2, text) in page_draws[p_idx]:
-                c.drawString(x1 + 2, (y1 + y2) / 2 - 3, str(text))
+                c.drawString(x1 + 2, (y1 + y2)/2 - 3, str(text))
             c.save()
             overlay = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
             PageMerge(page).add(overlay).render()
@@ -361,7 +383,7 @@ def fill_pdf_fields(pdf_bytes: bytes, values: Dict[str, str], flatten: bool=Fals
     bout = io.BytesIO(); writer.write(bout)
     return bout.getvalue()
 
-# ---- PDF widget positions (for auto map of Part II) --------------------------
+# ---- Widget geometry for auto-mapping (and overlay helpers) -----------------
 
 def extract_pdf_widgets(pdf_bytes: bytes):
     try:
@@ -380,9 +402,10 @@ def extract_pdf_widgets(pdf_bytes: bytes):
     except Exception:
         return []
 
+
 def _cluster_rows(widgets, y_tol: float = 8.0):
     rows = []
-    for w in sorted(widgets, key=lambda z: -z['yc']):  # top→bottom
+    for w in sorted(widgets, key=lambda z: -z['yc']):
         for row in rows:
             if abs(row[0]['yc'] - w['yc']) <= y_tol:
                 row.append(w); break
@@ -392,8 +415,9 @@ def _cluster_rows(widgets, y_tol: float = 8.0):
         row.sort(key=lambda z: z['xc'])
     return rows
 
+
 def auto_map_fields(pdf_bytes: bytes):
-    """Return ([12 field names for Line14], [12 for Line16]) or ([], [])."""
+    """Return ([12 names for Line14], [12 for Line16]) or ([], [])."""
     widgets = extract_pdf_widgets(pdf_bytes)
     if not widgets: return [], []
     first = [w for w in widgets if w['page'] == 0]
@@ -406,23 +430,31 @@ def auto_map_fields(pdf_bytes: bytes):
         names = [w['name'] for w in row]
         return names[1:13] if len(names) >= 13 else names[:12]
 
-    line14_names = pick(cand[0])     # top row of the grid
-    line16_names = pick(cand[2])     # third row of the grid
-    if len(line14_names) == 12 and len(line16_names) == 12:
-        return line14_names, line16_names
+    l14 = pick(cand[0]); l16 = pick(cand[2])
+    if len(l14) == 12 and len(l16) == 12:
+        return l14, l16
     return [], []
 
-# ---- Part I Anchor Overlay (PyMuPDF) ----------------------------------------
+# ---- Part I Anchor Overlay: robust placement into left-column widgets --------
 
 def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
     """
-    Draw Part I values on page 1 by locating printed labels and writing into the
-    boxes to their right. Works even if PDF field names are scrambled.
+    Draw Part I values by:
+      1) locating printed label text (e.g., '1 Name of employee') on page 1
+      2) finding the nearest form widget RECT on the same row to the RIGHT
+      3) writing the value inside that widget box (left column only)
+
     values keys: name, ssn, address, city, statezip, plan
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
     W = page.rect.width
+
+    # widgets geometry for page 1
+    widgets = [w for w in extract_pdf_widgets(pdf_bytes) if w.get('page') == 0]
+    def yc_of(w): return (w['y1'] + w['y2']) / 2.0
+    def label_center_y(r): return (r.y0 + r.y1) / 2.0
+    mid_x = W / 2.0  # split employee (left) vs employer (right)
 
     LABELS = [
         (["1 Name of employee", "Name of employee"], "name"),
@@ -439,44 +471,63 @@ def overlay_part1_by_anchors(pdf_bytes: bytes, values: dict) -> bytes:
                 return hits[0]
         return None
 
-    def right_box(r, pad_right=18):
+    def right_box_fallback(r, pad_right=18):
         return fitz.Rect(r.x1 + 6, r.y0 - 1, W - pad_right, r.y1 + 9)
 
     for terms, key in LABELS:
-        r = find_first(terms); val = values.get(key, "")
-        if r and val:
-            page.insert_textbox(right_box(r), str(val), fontsize=9, fontname="helv", align=0)
+        val = (values.get(key) or "").strip()
+        if not val: continue
+        r = find_first(terms)
+        if not r: continue
+        y0 = label_center_y(r)
+        cands = [
+            w for w in widgets
+            if abs(yc_of(w) - y0) <= 12 and w['x1'] > (r.x1 + 4) and (w['x1'] + w['x2']) / 2.0 < (mid_x - 6)
+        ]
+        if cands:
+            cands.sort(key=lambda w: w['x1'])
+            w = cands[0]
+            box = fitz.Rect(w['x1'] + 2, w['y1'] - 1, w['x2'] - 2, w['y2'] + 1)
+        else:
+            box = right_box_fallback(r)
+        page.insert_textbox(box, val, fontsize=9, fontname="helv", align=0)
 
+    # Plan Start Month (small box to the right of label)
     r_ps = find_first(["Plan Start Month", "Plan Start"])
-    if r_ps and values.get("plan"):
-        ps_box = fitz.Rect(r_ps.x1 + 6, r_ps.y0 - 1, r_ps.x1 + 45, r_ps.y1 + 9)
-        page.insert_textbox(ps_box, str(values["plan"]), fontsize=9, fontname="helv", align=0)
+    psv = (values.get("plan") or "").strip()
+    if r_ps and psv:
+        cands = [
+            w for w in widgets
+            if abs(yc_of(w) - label_center_y(r_ps)) <= 12 and w['x1'] > (r_ps.x1 + 4) and (w['x2'] - w['x1']) < 60
+        ]
+        if cands:
+            cands.sort(key=lambda w: w['x1'])
+            w = cands[0]
+            ps_box = fitz.Rect(w['x1'] + 2, w['y1'] - 1, w['x2'] - 2, w['y2'] + 1)
+        else:
+            ps_box = fitz.Rect(r_ps.x1 + 6, r_ps.y0 - 1, r_ps.x1 + 45, r_ps.y1 + 9)
+        page.insert_textbox(ps_box, psv, fontsize=9, fontname="helv", align=0)
 
-    out = io.BytesIO()
-    doc.save(out)
+    out = io.BytesIO(); doc.save(out)
     return out.getvalue()
 
 # ---------------------- App ----------------------
 
 st.title("ACA 1095-C Builder")
-st.markdown(
-    "> Upload your ACA workbook + a fillable IRS 1095-C, build the 12-month Interim grid, "
-    "compute Line 14/16 per rules, and generate a filled PDF for a selected employee."
-)
+st.caption("Upload your ACA workbook + a fillable IRS 1095-C. We compute Line 14/16 and generate PDFs.")
 
 with st.sidebar:
     st.header("1) Upload Inputs")
     excel_file = st.file_uploader("Excel ACA workbook", type=["xlsx","xlsm","xls"], accept_multiple_files=False)
     pdf_file   = st.file_uploader("Fillable 1095-C PDF (sample/template)", type=["pdf"], accept_multiple_files=False)
-    st.caption("Tip: use an official IRS fillable 1095-C PDF.")
+    st.caption("Tip: official IRS fillable PDFs work best.")
 
     st.header("2) Options")
     opt_flatten = st.checkbox("Also output a flattened copy (printed text)", value=True)
     opt_line15_from_pay = st.checkbox("Populate Line 15 from Pay Deductions (if present)", value=True)
     opt_overlay_part1 = st.checkbox(
-        "Use anchor overlay for Part I (recommended)",
-        value=True,
-        help="Prints Part I values next to labels (Name, SSN, Address, City, State/ZIP, Plan). More reliable than mapping fields."
+        "Use anchor overlay for Part I (recommended)", value=True,
+        help="Prints Part I values next to labels in the left column. Avoids fragile field-name guessing."
     )
 
 if excel_file is None:
@@ -487,6 +538,7 @@ with st.spinner("Reading and preparing inputs…"):
     data = load_excel(excel_file.read())
     emp_demo, emp_status, emp_elig, emp_enroll, dep_enroll, pay_ded = prepare_inputs(data)
     report_year = choose_report_year(emp_elig)
+
 st.success(f"Report Year selected: {report_year}")
 
 with st.spinner("Building Interim grid and Final codes…"):
@@ -508,17 +560,17 @@ emp_options = (
 sel = st.selectbox("Choose an employee to generate PDF", emp_options['label'].tolist())
 sel_id = sel.split(' — ')[0]
 
-# Show codes for that employee
+# Display monthly codes for selected employee
 months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
 final_row = final[final['employeeid']==sel_id].set_index('month')
 line14_map = {m: (final_row.loc[m, 'line14_final'] if m in final_row.index else '') for m in months}
 line16_map = {m: (final_row.loc[m, 'line16_final'] if m in final_row.index else '') for m in months}
 
-cols = st.columns(2)
-with cols[0]:
+c1, c2 = st.columns(2)
+with c1:
     st.markdown("**Line 14 (Offer) by month**")
     st.table(pd.DataFrame([line14_map], index=['line14_final']))
-with cols[1]:
+with c2:
     st.markdown("**Line 16 (Relief) by month**")
     st.table(pd.DataFrame([line16_map], index=['line16_final']))
 
@@ -539,19 +591,20 @@ if opt_line15_from_pay and not pay_ded.empty and 'employeeid' in pay_ded.columns
 
 st.divider()
 
-# PDF field detection / auto-map Part II
+# PDF mapping (Part II auto; Part I via overlay)
 st.subheader("PDF Field Mapping (Part I + Part II)")
 if pdf_file is None:
-    st.info("Upload a fillable 1095-C PDF to enable mapping and generation.")
+    st.info("Upload a fillable 1095-C PDF to enable generation.")
     st.stop()
 
 pdf_bytes = pdf_file.read()
 all_fields = extract_pdf_fields(pdf_bytes)
 if not all_fields:
-    st.warning("No form fields detected. I can only generate a flattened overlay copy.")
+    st.warning("No form fields detected. We'll still generate a flattened overlay copy.")
 with st.expander("Detected PDF fields (raw)"):
     st.write(all_fields)
 
+# Auto-map Part II
 auto_l14, auto_l16 = auto_map_fields(pdf_bytes) if all_fields else ([], [])
 if auto_l14 and auto_l16:
     default_line14, default_line16 = auto_l14, auto_l16
@@ -561,51 +614,7 @@ else:
     rest = all_fields[12:] if len(all_fields) > 12 else []
     default_line16 = rest[:12] if len(rest) >= 12 else []
 
-# Auto-map Part I by position for fallback field-filling (overlay is still recommended)
-def auto_map_part1_fields(pdf_bytes: bytes):
-    widgets = extract_pdf_widgets(pdf_bytes)
-    if not widgets: return None
-    first = [w for w in widgets if w['page']==0]
-    if not first: return None
-    try:
-        pdf = PdfReader(io.BytesIO(pdf_bytes)); media = pdf.pages[0].MediaBox
-        page_w = float(media[2])
-    except Exception:
-        page_w = max([w['x2'] for w in first] + [612.0])
-    mid_x = page_w/2.0
-    rows = _cluster_rows(first, y_tol=10.0)
-    cand = [r for r in rows if len(r) >= 12]
-    cand.sort(key=lambda r: -np.mean([w['yc'] for w in r]))
-    if not cand: return None
-    y14 = float(np.mean([w['yc'] for w in cand[0]]))
-    left_part1 = [w for w in first if (w['yc'] > y14 + 10) and (w['xc'] < mid_x - 10)]
-    left_rows = _cluster_rows(left_part1, y_tol=10.0)
-    left_rows.sort(key=lambda r: -np.mean([w['yc'] for w in r]))
-    def pick_name(row):
-        row.sort(key=lambda z: z['xc'])
-        return row[0]['name'] if row else None
-    name = ssn = addr = city = statezip = None
-    if len(left_rows) >= 1: name = pick_name(left_rows[0])
-    if len(left_rows) >= 2: ssn = pick_name(left_rows[1])
-    if len(left_rows) >= 3: addr = pick_name(left_rows[2])
-    if len(left_rows) >= 4: city = pick_name(left_rows[3])
-    if len(left_rows) >= 5: statezip = pick_name(left_rows[4])
-    if len(left_rows) >= 6: statezip = pick_name(left_rows[5])
-    band = [w for w in first if (y14 + 10 <= w['yc'] <= y14 + 80) and (w['xc'] > mid_x + 60)]
-    plan = None
-    if band:
-        band.sort(key=lambda z: (-(z['xc']), (z['x2']-z['x1'])))
-        plan = band[0]['name']
-    return name, ssn, addr, city, statezip, plan
-
-part1_auto = auto_map_part1_fields(pdf_bytes)
-if part1_auto:
-    fld_emp_name, fld_emp_ssn, fld_emp_address, fld_emp_city, fld_emp_state_zip, fld_plan_start = part1_auto
-    st.success("Auto-mapped Part I employee fields (Name, SSN, Address, City, State/ZIP, Plan Start).")
-else:
-    st.warning("Couldn't auto-map Part I fields; overlay will still print Part I correctly.")
-
-# Compose Part I data from tables
+# Compose Part I strings
 emp_row = emp_demo[emp_demo['employeeid'] == sel_id]
 full_name = emp_ssn = addr = city = state_zip = ""
 if not emp_row.empty:
@@ -624,51 +633,37 @@ st.subheader("Generate & Download")
 run = st.button("Generate PDF for selected employee", type="primary")
 if run:
     values = {}
-    # Fill Part I fields only if we successfully mapped actual field names (overlay prints anyway)
-    try:
-        if part1_auto:
-            if fld_emp_name and full_name: values[fld_emp_name] = full_name
-            if fld_emp_ssn and emp_ssn: values[fld_emp_ssn] = emp_ssn
-            if fld_emp_address and addr: values[fld_emp_address] = addr
-            if fld_emp_city and city: values[fld_emp_city] = city
-            if fld_emp_state_zip and state_zip: values[fld_emp_state_zip] = state_zip
-            if fld_plan_start: values[fld_plan_start] = f"{1:02d}"
-    except Exception:
-        pass
-
-    # Part II (Line 14/16)
-    l14 = default_line14 or []
-    l16 = default_line16 or []
+    # Part II
     for i, m in enumerate(months):
-        if i < len(l14) and l14[i]: values[l14[i]] = line14_map.get(m, '')
-        if i < len(l16) and l16[i]: values[l16[i]] = line16_map.get(m, '')
+        if i < len(default_line14) and default_line14[i]:
+            values[default_line14[i]] = line14_map.get(m, '')
+        if i < len(default_line16) and default_line16[i]:
+            values[default_line16[i]] = line16_map.get(m, '')
+    # Optionally add Line 15 here if mapped in your template (not auto-mapped by default)
 
+    # Fill fields, then overlay Part I
     fillable_bytes = fill_pdf_fields(pdf_bytes, values, flatten=False)
-
-    # Anchor overlay for Part I (recommended)
     if opt_overlay_part1:
         part1_vals = {"name": full_name, "ssn": emp_ssn, "address": addr,
                       "city": city, "statezip": state_zip, "plan": f"{1:02d}"}
         fillable_bytes = overlay_part1_by_anchors(fillable_bytes, part1_vals)
 
-    st.download_button("Download filled (fillable) PDF",
-                       data=fillable_bytes, file_name=f"1095C_{sel_id}_fillable.pdf",
-                       mime="application/pdf")
-    flat_bytes = fill_pdf_fields(fillable_bytes, values, flatten=True) if opt_flatten else None
-    if flat_bytes:
-        st.download_button("Download flattened (printed) PDF",
-                           data=flat_bytes, file_name=f"1095C_{sel_id}_flattened.pdf",
-                           mime="application/pdf")
+    st.download_button("Download filled (fillable) PDF", data=fillable_bytes,
+                       file_name=f"1095C_{sel_id}_fillable.pdf", mime="application/pdf")
+
+    if opt_flatten or not all_fields:
+        flat_bytes = fill_pdf_fields(fillable_bytes, values, flatten=True)
+        st.download_button("Download flattened (printed) PDF", data=flat_bytes,
+                           file_name=f"1095C_{sel_id}_flattened.pdf", mime="application/pdf")
 
 # ---------- Bulk ZIP ----------
 st.subheader("Bulk Generate (optional)")
-st.caption("Generates a .zip with one PDF per employee using auto-mapped fields & Part I overlay.")
+st.caption("Generates a .zip with one PDF per employee using Part I overlay + Part II auto-mapping.")
 if st.button("Generate Zip for All Employees"):
     import zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         for eid in interim['employeeid'].drop_duplicates().tolist():
-            # Part I text
             er = emp_demo[emp_demo['employeeid']==eid]
             full = ssn2 = addr2 = city2 = statezip2 = ""
             if not er.empty:
@@ -687,26 +682,19 @@ if st.button("Generate Zip for All Employees"):
             l16m = {m: (fr.loc[m, 'line16_final'] if m in fr.index else '') for m in months}
 
             vals = {}
-            if part1_auto:
-                if fld_emp_name and full: vals[fld_emp_name] = full
-                if fld_emp_ssn and ssn2: vals[fld_emp_ssn] = ssn2
-                if fld_emp_address and addr2: vals[fld_emp_address] = addr2
-                if fld_emp_city and city2: vals[fld_emp_city] = city2
-                if fld_emp_state_zip and statezip2: vals[fld_emp_state_zip] = statezip2
-                if fld_plan_start: vals[fld_plan_start] = f"{1:02d}"
-            # Part II
             for i, m in enumerate(months):
                 if i < len(default_line14) and default_line14[i]:
                     vals[default_line14[i]] = l14m.get(m, '')
                 if i < len(default_line16) and default_line16[i]:
                     vals[default_line16[i]] = l16m.get(m, '')
+
             filled = fill_pdf_fields(pdf_bytes, vals, flatten=False)
             if opt_overlay_part1:
                 pvals = {"name": full, "ssn": ssn2, "address": addr2,
                          "city": city2, "statezip": statezip2, "plan": f"{1:02d}"}
                 filled = overlay_part1_by_anchors(filled, pvals)
-            if opt_flatten:
+            if opt_flatten or not all_fields:
                 filled = fill_pdf_fields(filled, vals, flatten=True)
             zf.writestr(f"1095C_{eid}.pdf", filled)
-    st.download_button("Download ZIP", data=buf.getvalue(),
-                       file_name="1095C_all_employees.zip", mime="application/zip")
+
+    st.download_button("Download ZIP", data=buf.getvalue(), file_name="1095C_all_employees.zip", mime="application/zip")
