@@ -4,15 +4,13 @@
 import streamlit as st
 import pandas as pd
 
-from aca1095c import (
-    load_excel, prepare_inputs,
-    choose_report_year, build_interim, build_final,
-)
-from aca1095c.pdf import (
-    extract_pdf_fields, fill_pdf_fields, auto_map_fields,
-    fill_part1_fields_strict, overlay_part1_by_anchors, _format_ssn,
-    build_part2_values, MONTHS,
-)
+from aca1095c.ingestion import load_excel, prepare_inputs
+from aca1095c.transform import choose_report_year, build_interim, build_final
+
+from aca1095c.pdf.common import extract_pdf_fields, fill_pdf_fields, auto_map_fields
+from aca1095c.pdf.part1 import fill_part1_fields_strict, overlay_part1_by_anchors, _format_ssn
+from aca1095c.pdf.part2 import build_part2_values, MONTHS
+
 
 st.set_page_config(page_title="ACA 1095-C Builder (Two-Step)", layout="wide")
 
