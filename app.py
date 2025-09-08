@@ -111,12 +111,18 @@ st.divider()
 # ============================================================
 # STEP 1 — Generate Part II only
 # ============================================================
+st.write("")  # spacer
 st.header("Step 1 — Generate Part II only")
 
 template_pdf_bytes = template_pdf.read()
 all_fields = extract_pdf_fields(template_pdf_bytes)
-with st.expander("Detected PDF fields (raw)"):
-    st.write(all_fields)
+
+# Optional: show field names only when asked (prevents header/label overlap)
+show_debug = st.checkbox("Show detected PDF field names", value=False)
+if show_debug:
+    with st.expander("Detected PDF fields (raw)", expanded=True):
+        st.code("\n".join(all_fields) if all_fields else "(none)", language="text")
+
 
 auto_l14, auto_l16 = auto_map_fields(template_pdf_bytes) if all_fields else ([], [])
 if auto_l14 and auto_l16:
